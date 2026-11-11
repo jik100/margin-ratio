@@ -17,6 +17,7 @@ JPX(東証) 銘柄別信用取引残高PDF -> 信用倍率(買残高 ÷ 売残�
 import argparse
 import csv
 import io
+import json
 import re
 import sys
 import unicodedata
@@ -128,6 +129,36 @@ def process(date, src, out, debug):
     print(f"{row[0]}  " + "  ".join(f"{jp}={row[3 + 3 * i]}" for i, (_, jp) in enumerate(MARKETS)))
 
 
+TOOLTIP_JS = """<script>
+(function(){
+var D=__DATA__;
+var tip=document.getElementById('tip'),guide=document.getElementById('guide');
+function show(i,e){
+  var d=D[i],h='<b>'+d.d+'</b>';
+  d.m.forEach(function(m){
+    h+='<div class="row"><span class="nm" style="color:'+m.c+'">'+m.n+'</span> '+m.r+
+       '<br><span class="sub">買残高 '+m.b+'億円 / 売残高 '+m.s+'億円</span></div>';
+  });
+  tip.innerHTML=h;tip.style.display='block';
+  var w=tip.offsetWidth,hh=tip.offsetHeight,x=e.clientX+14,y=e.clientY+14;
+  if(x+w>window.innerWidth-8)x=e.clientX-w-14;
+  if(x<8)x=8;
+  if(y+hh>window.innerHeight-8)y=window.innerHeight-hh-8;
+  if(y<8)y=8;
+  tip.style.left=x+'px';tip.style.top=y+'px';
+  guide.setAttribute('x1',d.x);guide.setAttribute('x2',d.x);guide.style.display='';
+}
+function hide(){tip.style.display='none';guide.style.display='none';}
+Array.prototype.forEach.call(document.querySelectorAll('.col'),function(el){
+  el.addEventListener('mousemove',function(e){show(+el.getAttribute('data-i'),e);});
+  el.addEventListener('mouseleave',hide);
+  el.addEventListener('click',function(e){show(+el.getAttribute('data-i'),e);});
+});
+document.addEventListener('click',function(e){if(!e.target.closest||!e.target.closest('.col'))hide();});
+})();
+</script>"""
+
+
 COLORS = {"prime": "#2a6fdb", "standard": "#e07b00", "growth": "#1a9a5b", "total": "#8a3ffc"}
 
 
@@ -165,11 +196,25 @@ def make_html(csv_path, html_path, n=20):
         g.append(f'<polyline fill="none" stroke="{c}" stroke-width="2.5" points="{" ".join(f"{x:.1f},{y:.1f}" for x, y, _ in pts)}"/>')
         for j, (x, y, v) in enumerate(pts):
             r_ = 4 if show_all else 3
-            g.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r_}" fill="{c}"><title>{jp} {rows[j]["date"]}: {v:.4f}</title></circle>')
+            g.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r_}" fill="{c}"/>')
             if show_all or j == len(pts) - 1:
                 g.append(f'<text x="{x:.1f}" y="{y-9:.1f}" text-anchor="middle" class="lb" fill="{c}">{v:.2f}</text>')
         x, y, v = pts[-1]
         g.append(f'<text x="{x+14:.1f}" y="{y+4:.1f}" class="lg" fill="{c}">{jp}</text>')
+
+    def oku(yen):  # 円 -> 億円 (小数1桁、3桁区切り)
+        return f"{int(yen) / 1e8:,.1f}"
+
+    data = []
+    for i, r in enumerate(rows):
+        data.append({"d": r["date"], "x": round(X(i), 1), "m": [
+            {"n": jp, "c": COLORS[k], "r": f'{float(r[f"{k}_ratio"]):.2f}',
+             "b": oku(r[f"{k}_buy"]), "s": oku(r[f"{k}_sell"])} for k, jp in MARKETS]})
+    step = (W - L - R) / (len(rows) - 1) if len(rows) > 1 else (W - L - R)
+    g.append(f'<line id="guide" x1="0" x2="0" y1="{T}" y2="{H-B}" class="guide" style="display:none"/>')
+    for i in range(len(rows)):
+        g.append(f'<rect class="col" data-i="{i}" x="{X(i) - step / 2:.1f}" y="{T}" width="{step:.1f}" height="{H-T-B}" fill="transparent"/>')
+    js = TOOLTIP_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False))
 
     head = "".join(f"<th>{jp}</th>" for _, jp in MARKETS)
     body = "".join(
@@ -187,10 +232,16 @@ h1{{font-size:1.2rem}} svg{{max-width:100%;height:auto}}
 .grid{{stroke:var(--grid)}} .ax{{fill:var(--mut);font-size:12px}} .lb{{font-size:11px;font-weight:600}} .lg{{font-size:13px;font-weight:700}}
 .wrap{{overflow-x:auto}} table{{border-collapse:collapse;margin-top:16px}}
 th,td{{border:1px solid var(--grid);padding:6px 12px;text-align:right}}
+.col{{cursor:crosshair}} .guide{{stroke:var(--mut);stroke-dasharray:4 4}} .hint{{color:var(--mut);font-size:12px;margin:4px 0}}
+#tip{{position:fixed;display:none;pointer-events:none;background:var(--bg);color:var(--fg);border:1px solid var(--grid);border-radius:8px;padding:8px 12px;font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,.35);z-index:10;white-space:nowrap}}
+#tip .row{{margin-top:6px}} #tip .nm{{font-weight:700}} #tip .sub{{color:var(--mut);font-size:12px}}
 </style></head><body>
 <h1>信用倍率(買残高÷売残高) 直近{len(rows)}日(申込日ベース)</h1>
+<p class="hint">グラフにマウスを乗せる(スマホはタップ)と、各市場の買残高・売残高(億円)が表示されます。</p>
 <div class="wrap"><svg viewBox="0 0 {W} {H}" width="{W}" role="img" aria-label="信用倍率の推移">{"".join(g)}</svg></div>
 <div class="wrap"><table><tr><th>申込日</th>{head}</tr>{body}</table></div>
+<div id="tip"></div>
+{js}
 </body></html>"""
     html_path.write_text(html, encoding="utf-8")
     print(f"グラフを更新しました: {html_path}")
