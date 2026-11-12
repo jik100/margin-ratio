@@ -37,6 +37,7 @@ function el(n,a,t){var e=document.createElementNS(NS,n);for(var k in a)e.setAttr
 function yen(v){if(v>=1e8)return (v/1e8).toLocaleString('ja-JP',{maximumFractionDigits:2})+'億円';return Math.round(v/1e4).toLocaleString('ja-JP')+'万円';}
 function sh(v){return v.toLocaleString('ja-JP')+'株';}
 function say(t){msgEl.textContent=t;}
+function cname(n){return String(n||'').replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();}
 function show(i,e){
   var d=D[i],h='<b>'+d.d+'</b>';
   d.m.forEach(function(m){
@@ -46,7 +47,7 @@ function show(i,e){
   if(STK){
     var p=STK.pts[i],nm='<span class="nm" style="color:'+SC+'">'+esc(STK.n||STK.c)+' ('+esc(STK.c)+')</span> ';
     if(p&&p.e){
-      h+='<div class="row">'+nm+(p.r===null?'売残高なし':p.r.toFixed(2))+
+      h+='<div class="row">'+nm+(p.r===null?'売残株数なし':p.r.toFixed(2)+' (株数ベース)')+
          '<br><span class="sub">買残高 '+yen(p.e[1])+' ('+sh(p.e[3])+') / 売残高 '+yen(p.e[0])+' ('+sh(p.e[2])+')</span></div>';
     }else{h+='<div class="row">'+nm+'<span class="sub">この日のデータなし</span></div>';}
   }
@@ -71,11 +72,11 @@ function clearStk(){while(stk.firstChild)stk.removeChild(stk.firstChild);STK=nul
 function tick(v){return v>=100?v.toFixed(0):(v>=10?v.toFixed(1):v.toFixed(2));}
 function draw(j,code){
   clearStk();
-  var pts=G.dates.map(function(d,i){var e=(j.h&&j.h[d])||null;return {e:e,r:(e&&e[0]>0)?e[1]/e[0]:null,x:D[i].x};});
-  STK={c:code,n:j.n||'',pts:pts};
+  var pts=G.dates.map(function(d,i){var e=(j.h&&j.h[d])||null;return {e:e,r:(e&&e[2]>0)?e[3]/e[2]:null,x:D[i].x};});
+  STK={c:code,n:cname(j.n),pts:pts};
   var vs=pts.filter(function(p){return p.r!==null;}).map(function(p){return p.r;});
   var have=pts.filter(function(p){return p.e;}).length;
-  if(!vs.length){say((j.n||code)+' ('+code+'): 表示期間に、売残高があり倍率を計算できる日がありません。');return;}
+  if(!vs.length){say((cname(j.n)||code)+' ('+code+'): 表示期間に、売残株数があり倍率を計算できる日がありません。');return;}
   var lo=Math.min.apply(null,vs),hi=Math.max.apply(null,vs),pad=(hi-lo)*0.12||Math.max(hi*0.1,0.5);
   lo=Math.max(0,lo-pad);hi=hi+pad;
   var ph=G.H-G.T-G.B;
@@ -87,8 +88,8 @@ function draw(j,code){
     stk.appendChild(el('line',{x1:ax-4,x2:ax,y1:y,y2:y,stroke:SC}));
     stk.appendChild(el('text',{x:ax+7,y:y+4,fill:SC,'font-size':12},tick(v)));
   }
-  var title=(j.n||code);if(title.length>16)title=title.slice(0,16)+'…';
-  stk.appendChild(el('text',{x:G.W-6,y:G.T-12,'text-anchor':'end',fill:SC,'font-size':12,'font-weight':700},title+' ('+code+') 右軸'));
+  var title=(cname(j.n)||code);if(title.length>16)title=title.slice(0,16)+'…';
+  stk.appendChild(el('text',{x:G.W-6,y:G.T-12,'text-anchor':'end',fill:SC,'font-size':12,'font-weight':700},title+' ('+code+') 右軸・株数ベース'));
   var seg=[];
   function flush(){if(seg.length>1)stk.appendChild(el('polyline',{points:seg.map(function(a){return a[0]+','+a[1];}).join(' '),fill:'none',stroke:SC,'stroke-width':2.5,'stroke-dasharray':'7 4'}));seg=[];}
   pts.forEach(function(p){
@@ -97,7 +98,7 @@ function draw(j,code){
     stk.appendChild(el('circle',{cx:p.x,cy:y,r:4,fill:SC}));
   });
   flush();
-  say((j.n||code)+' ('+code+') を右軸(ピンクの破線)で表示中。データのある日: '+have+' / '+G.dates.length+' 日'+(have<G.dates.length?'(取り込み開始前の日は空白です)':''));
+  say((cname(j.n)||code)+' ('+code+') を右軸(ピンクの破線)で表示中。倍率は株数ベース(買残株数÷売残株数)。データのある日: '+have+' / '+G.dates.length+' 日'+(have<G.dates.length?'(取り込み開始前の日は空白です)':''));
 }
 function norm(s){s=s.normalize('NFKC').trim().toUpperCase();if(s.length===5&&s.charAt(4)==='0')s=s.slice(0,4);return s;}
 function go(){
