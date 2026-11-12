@@ -150,29 +150,33 @@ def tail_numbers(rest):
 
 
 def recover_ids(head):
-    """行の左側から (コード5桁, ISIN) を取り出す。取れなければ None。
+    """行の左側から (コード5桁, ISIN, コードが確実か) を取り出す。
     長い銘柄名が重なって文字が入り混じっても、コードとISINは半角英数字なので、
-    半角英数字だけを順に並べて復元する。ETNなど半角の名前の文字(E,T,N)が混ざる行にも対応する。"""
+    半角英数字だけを順に並べて復元する。名前の文字(小文字、ETNの E,T,N など)が混ざった場合は
+    復元はするが「確実でない」と記録し、別の行のコードと一致したときだけ採用する。"""
     s = "".join(ch for ch in head if ch.isascii() and ch.isalnum())
-    isin, region = None, ""
+    isin, region, dirty = None, "", False
     m = re.search(r"[A-Z]{2}[0-9A-Z]{10}$", s)
     if m and (m.group()[:2] != "JP" or m.group()[2:].isdigit()):
         isin, region = m.group(), s[:m.start()]
-    else:                                   # 日本のISINは JP+数字10桁。間に混ざった英大文字は除く
-        i = s.rfind("JP")
+    else:                                   # 日本のISINは JP+数字10桁。間に混ざった名前の文字は除く
+        dirty = True
+        u = re.sub(r"[a-z]", "", s)         # ISINやコードに小文字はない
+        i = u.rfind("JP")
         while i != -1:
-            tail = s[i + 2:]
+            tail = u[i + 2:]
             digits = [c for c in tail if c.isdigit()]
             if len(digits) == 10 and len(tail) <= 20 and all(c.isdigit() or c.isupper() for c in tail):
-                isin, region = "JP" + "".join(digits), s[:i]
+                isin, region = "JP" + "".join(digits), u[:i]
                 break
-            i = s.rfind("JP", 0, i)
+            i = u.rfind("JP", 0, i)
     if isin is None:
-        return None, None
+        return None, None, False
+    if CODE_RE.match(region[-5:]):
+        return region[-5:], isin, not dirty
     r = re.sub(r"[a-z]", "", region)        # コードに小文字はない(名前の文字が混ざったもの)
     r = re.sub(r"[A-Z]+$", "", r)           # ISINの直前に混ざった名前の末尾(ETNなど)
-    code = r[-5:] if CODE_RE.match(r[-5:]) else None
-    return code, isin
+    return (r[-5:] if CODE_RE.match(r[-5:]) else None), isin, False
 
 
 def clean_name(head):
@@ -180,6 +184,7 @@ def clean_name(head):
     h = re.sub(r"\s+\S\s*$", "", h)                  # 末尾の 貸/制/他
     h = re.sub(r"\s*(プライム|スタンダード|グロース|投信等)\s*$", "", h)
     h = re.sub(r"\s*(普通株式|受益証券|投資証券|優先株式|出資証券)\s*$", "", h)
+    h = re.sub(r"\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*(?:貸|制|他)?\s*$", "", h)
     return h.strip()
 
 
@@ -201,7 +206,7 @@ def pick_name(line1, line2, code):
 
 def parse_issues(pdf):
     """全ページの『株数の行』『金額の行』を集め、ISINで1銘柄ずつ対応づける。
-    戻り値: 株数, 金額, 名前, PDFの総合計の銘柄数, 読み取れなかった行のリスト"""
+    戻り値: 株数, 金額, 名前, PDFの総合計の銘柄数, 読み取れなかった行のリスト, ISIN"""
     recs, n_total = [], None
     for page in pdf.pages:
         text = page.extract_text() or ""
@@ -215,12 +220,12 @@ def parse_issues(pdf):
             m = MARK_RE.search(raw)
             if not m:
                 continue
-            code, isin = recover_ids(raw[:m.start()])
-            recs.append({"kind": m.group("mark"), "raw": raw, "code": code, "isin": isin,
+            code, isin, clean = recover_ids(raw[:m.start()])
+            recs.append({"kind": m.group("mark"), "raw": raw, "code": code, "isin": isin, "clean": clean,
                          "nums": tail_numbers(m.group("rest"))})
         page.flush_cache()
 
-    shs, val, names, bad = {}, {}, {}, []
+    shs, val, names, isins, bad = {}, {}, {}, {}, []
     by = {"Shs": {}, "Val": {}}
     for r in recs:
         tag = "株数" if r["kind"] == "Shs" else "金額"
@@ -237,16 +242,30 @@ def parse_issues(pdf):
         if r2 is None:
             bad.append("[金額の行なし] " + r1["raw"])
             continue
-        code = r1["code"] or r2["code"]          # 日本語の行(1行目)を優先
+        c1, c2 = r1["code"], r2["code"]
+        if c1 and c2:
+            if c1 == c2:
+                code = c1
+            elif r1["clean"] != r2["clean"]:
+                code = c1 if r1["clean"] else c2        # 確実なほうを採用
+            else:
+                code = None
+        elif c1 and r1["clean"]:
+            code = c1
+        elif c2 and r2["clean"]:
+            code = c2
+        else:
+            code = None
         if not code:
-            bad.append("[コード読取不可] " + r2["raw"])
+            bad.append("[コード不確実] " + r2["raw"])  # 誤ったコードで別の銘柄を汚さないよう、採用しない
             continue
         shs[code], val[code] = r1["nums"], r2["nums"]
         names[code] = pick_name(r1["raw"], r2["raw"], code)
+        isins[code] = r1["isin"] or r2["isin"]
     for key, r2 in by["Val"].items():
         if key not in by["Shs"]:
             bad.append("[株数の行なし] " + r2["raw"])
-    return shs, val, names, n_total, bad
+    return shs, val, names, n_total, bad, isins
 
 
 def check_issues(shs, val, n_total, total):
@@ -280,11 +299,11 @@ def stock_key(code5):
     return code5[:4] if code5[4] == "0" else code5
 
 
-def save_issues(sdir, date, shs, val, names):
+def save_issues(sdir, date, shs, val, names, isins=None):
     """銘柄ごとのJSON(stocks/4461.json)に、その日の [売金額, 買金額, 売株数, 買株数] を追記する"""
     sdir.mkdir(parents=True, exist_ok=True)
     iso = f"{date[:4]}-{date[4:6]}-{date[6:]}"
-    saved = 0
+    saved = conflicts = 0
     for code, (sv, bv) in val.items():
         ss, bs = shs.get(code, (0, 0))
         if sv == 0 and bv == 0 and ss == 0 and bs == 0:
@@ -297,11 +316,19 @@ def save_issues(sdir, date, shs, val, names):
                 obj = json.loads(fp.read_text(encoding="utf-8"))
             except ValueError:
                 pass
+        isin = (isins or {}).get(code)
+        if isin and obj.get("i") and obj["i"] != isin:
+            conflicts += 1          # 同じコードで別のISIN: 別の銘柄の可能性があるので書き込まない
+            continue
+        if isin:
+            obj["i"] = isin
         if names.get(code):
             obj["n"] = names[code]
         obj["h"][iso] = [sv, bv, ss, bs]
         fp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         saved += 1
+    if conflicts:
+        print(f"::notice::{date} コードとISINが既存の記録と合わない {conflicts} 銘柄は、保存しませんでした")
     dates = read_stock_dates(sdir) | {date}
     (sdir / "_dates.json").write_text(json.dumps(sorted(dates)), encoding="utf-8")
     return saved
@@ -339,7 +366,7 @@ def process(date, src, out, debug, do_totals=True, do_stocks=True):
 def process_stocks(date, pdf, found, out, debug):
     """銘柄別データを保存する。失敗しても、市場別の集計の記録は止めない(警告だけ出す)"""
     try:
-        shs, val, names, n_total, bad = parse_issues(pdf)
+        shs, val, names, n_total, bad, isins = parse_issues(pdf)
         if debug:
             (BASE / f"debug_{date}_page1.txt").write_text(pdf.pages[0].extract_text() or "", encoding="utf-8")
             (BASE / f"debug_{date}_unparsed.txt").write_text("\n".join(bad), encoding="utf-8")
@@ -359,13 +386,13 @@ def process_stocks(date, pdf, found, out, debug):
             print(f"::notice::{date} 銘柄別データ: {msg}")
         for ex in bad[:5]:
             print(f"::notice::{date} 読み取れなかった行の例: {ex[:200]}")
-        n = save_issues(out.parent / "stocks", date, shs, val, names)
+        n = save_issues(out.parent / "stocks", date, shs, val, names, isins)
         print(f"{date}: 銘柄別データを保存しました ({n} 銘柄 / PDF上 {len(val)} 銘柄)")
     except Exception as e:  # noqa: BLE001
         print(f"::warning::{date} 銘柄別データの処理に失敗しました: {e}")
 
 
-TOOLTIP_JS = """<script>
+TOOLTIP_JS = r"""<script>
 (function(){
 var D=__DATA__, G=__GEO__, STK=null, SC='#e11d74', NS='http://www.w3.org/2000/svg';
 var tip=document.getElementById('tip'),guide=document.getElementById('guide'),stk=document.getElementById('stk');
@@ -375,6 +402,7 @@ function el(n,a,t){var e=document.createElementNS(NS,n);for(var k in a)e.setAttr
 function yen(v){if(v>=1e8)return (v/1e8).toLocaleString('ja-JP',{maximumFractionDigits:2})+'億円';return Math.round(v/1e4).toLocaleString('ja-JP')+'万円';}
 function sh(v){return v.toLocaleString('ja-JP')+'株';}
 function say(t){msgEl.textContent=t;}
+function cname(n){return String(n||'').replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();}
 function show(i,e){
   var d=D[i],h='<b>'+d.d+'</b>';
   d.m.forEach(function(m){
@@ -384,7 +412,7 @@ function show(i,e){
   if(STK){
     var p=STK.pts[i],nm='<span class="nm" style="color:'+SC+'">'+esc(STK.n||STK.c)+' ('+esc(STK.c)+')</span> ';
     if(p&&p.e){
-      h+='<div class="row">'+nm+(p.r===null?'売残高なし':p.r.toFixed(2))+
+      h+='<div class="row">'+nm+(p.r===null?'売残株数なし':p.r.toFixed(2)+' (株数ベース)')+
          '<br><span class="sub">買残高 '+yen(p.e[1])+' ('+sh(p.e[3])+') / 売残高 '+yen(p.e[0])+' ('+sh(p.e[2])+')</span></div>';
     }else{h+='<div class="row">'+nm+'<span class="sub">この日のデータなし</span></div>';}
   }
@@ -409,11 +437,11 @@ function clearStk(){while(stk.firstChild)stk.removeChild(stk.firstChild);STK=nul
 function tick(v){return v>=100?v.toFixed(0):(v>=10?v.toFixed(1):v.toFixed(2));}
 function draw(j,code){
   clearStk();
-  var pts=G.dates.map(function(d,i){var e=(j.h&&j.h[d])||null;return {e:e,r:(e&&e[0]>0)?e[1]/e[0]:null,x:D[i].x};});
-  STK={c:code,n:j.n||'',pts:pts};
+  var pts=G.dates.map(function(d,i){var e=(j.h&&j.h[d])||null;return {e:e,r:(e&&e[2]>0)?e[3]/e[2]:null,x:D[i].x};});
+  STK={c:code,n:cname(j.n),pts:pts};
   var vs=pts.filter(function(p){return p.r!==null;}).map(function(p){return p.r;});
   var have=pts.filter(function(p){return p.e;}).length;
-  if(!vs.length){say((j.n||code)+' ('+code+'): 表示期間に、売残高があり倍率を計算できる日がありません。');return;}
+  if(!vs.length){say((cname(j.n)||code)+' ('+code+'): 表示期間に、売残株数があり倍率を計算できる日がありません。');return;}
   var lo=Math.min.apply(null,vs),hi=Math.max.apply(null,vs),pad=(hi-lo)*0.12||Math.max(hi*0.1,0.5);
   lo=Math.max(0,lo-pad);hi=hi+pad;
   var ph=G.H-G.T-G.B;
@@ -425,8 +453,8 @@ function draw(j,code){
     stk.appendChild(el('line',{x1:ax-4,x2:ax,y1:y,y2:y,stroke:SC}));
     stk.appendChild(el('text',{x:ax+7,y:y+4,fill:SC,'font-size':12},tick(v)));
   }
-  var title=(j.n||code);if(title.length>16)title=title.slice(0,16)+'…';
-  stk.appendChild(el('text',{x:G.W-6,y:G.T-12,'text-anchor':'end',fill:SC,'font-size':12,'font-weight':700},title+' ('+code+') 右軸'));
+  var title=(cname(j.n)||code);if(title.length>16)title=title.slice(0,16)+'…';
+  stk.appendChild(el('text',{x:G.W-6,y:G.T-12,'text-anchor':'end',fill:SC,'font-size':12,'font-weight':700},title+' ('+code+') 右軸・株数ベース'));
   var seg=[];
   function flush(){if(seg.length>1)stk.appendChild(el('polyline',{points:seg.map(function(a){return a[0]+','+a[1];}).join(' '),fill:'none',stroke:SC,'stroke-width':2.5,'stroke-dasharray':'7 4'}));seg=[];}
   pts.forEach(function(p){
@@ -435,7 +463,7 @@ function draw(j,code){
     stk.appendChild(el('circle',{cx:p.x,cy:y,r:4,fill:SC}));
   });
   flush();
-  say((j.n||code)+' ('+code+') を右軸(ピンクの破線)で表示中。データのある日: '+have+' / '+G.dates.length+' 日'+(have<G.dates.length?'(取り込み開始前の日は空白です)':''));
+  say((cname(j.n)||code)+' ('+code+') を右軸(ピンクの破線)で表示中。倍率は株数ベース(買残株数÷売残株数)。データのある日: '+have+' / '+G.dates.length+' 日'+(have<G.dates.length?'(取り込み開始前の日は空白です)':''));
 }
 function norm(s){s=s.normalize('NFKC').trim().toUpperCase();if(s.length===5&&s.charAt(4)==='0')s=s.slice(0,4);return s;}
 function go(){
