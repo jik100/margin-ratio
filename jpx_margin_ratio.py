@@ -122,7 +122,7 @@ def append_row(path, date, found):
 # PDFの各銘柄は2行: 1行目=株数(Shs.)、2行目=金額(Val.)。どちらも
 #   売残高, 前日比, 上場比(%または*/-), 買残高, 前日比, 上場比, (一般/制度の売買内訳 8個) の14個で終わる
 ISSUE_RE = re.compile(
-    r"(?P<head>.*?)(?<!\S)(?P<code>[0-9][0-9A-Z]{4})\s+(?P<isin>[A-Z]{2}[0-9A-Z]{10})\s+"
+    r"(?P<head>.*?)(?<!\S)(?P<code>[0-9][0-9A-Z]{4})\s*(?P<isin>[A-Z]{2}[0-9A-Z]{10})\s*"
     r"(?P<kind>株数|金額)\s*(?:Shs|Val)\.\s*(?P<rest>.*)$")
 TOTAL_CNT_RE = re.compile(r"総合計\s*(\d[\d,]*)\s*銘柄")
 SKIP_RE = re.compile(r"sub-?total|\btotal\b|小計|総合計", re.I)
@@ -131,7 +131,7 @@ INT_RE = re.compile(r"^\d[\d,]*$")
 
 def tail_numbers(rest):
     """行末の14個から (売残高, 買残高) を返す。名前の折り返し断片が先頭に混ざっても影響しない"""
-    toks = rest.replace("▲", " ").split()
+    toks = re.sub(r"%(?=\d)", "% ", rest.replace("▲", " ")).split()
     if len(toks) < 14:
         return None
     t = toks[-14:]
@@ -267,7 +267,9 @@ def process_stocks(date, pdf, found, out, debug):
             (BASE / f"debug_{date}_unparsed.txt").write_text("\n".join(bad), encoding="utf-8")
         problems = check_issues(shs, val, n_total, found.get("total"))
         if bad:
-            problems.append(f"読み取れなかった行が {len(bad)} 行あります(例: {bad[0][:80]})")
+            problems.append(f"読み取れなかった行が {len(bad)} 行あります")
+            for ex in bad[:3]:
+                print(f"::warning::{date} 読み取れなかった行の例: {ex[:220]}")
         if problems:
             for msg in problems:
                 print(f"::warning::{date} 銘柄別データ: {msg}")
@@ -451,7 +453,7 @@ h1{{font-size:1.2rem}} svg{{max-width:100%;height:auto}}
 th,td{{border:1px solid var(--grid);padding:6px 12px;text-align:right}}
 .col{{cursor:crosshair}} .guide{{stroke:var(--mut);stroke-dasharray:4 4}} .hint{{color:var(--mut);font-size:12px;margin:4px 0}}
 #tip{{position:fixed;display:none;pointer-events:none;background:var(--bg);color:var(--fg);border:1px solid var(--grid);border-radius:8px;padding:8px 12px;font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,.35);z-index:10;white-space:nowrap}}
-.bar{{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px}} .bar .hint{{flex:1 1 320px}}
+.bar{{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px;max-width:{W}px}} .bar .hint{{flex:1 1 320px}}
 .search{{display:flex;gap:6px;align-items:center}}
 .search input{{font-size:16px;width:11em;padding:6px 8px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg)}}
 .search button{{font-size:14px;padding:6px 12px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}}
