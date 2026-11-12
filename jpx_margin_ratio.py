@@ -127,11 +127,13 @@ ISSUE_RE = re.compile(
 MARK_RE = re.compile(r"(?P<mark>Shs|Val)\.\s*(?P<rest>.*)$")
 TOTAL_CNT_RE = re.compile(r"総合計\s*(\d[\d,]*)\s*銘柄")
 # 小計・総合計の行(銘柄ではない)。英語の銘柄名が "Total ..." で始まっても除外しないよう、Val./Shs.の直前までを見る
-SKIP_JP = re.compile(r"^\s*(?:(?:プライム|スタンダード|グロース|投信等)\s*小計|総合計)")
-SKIP_EN = re.compile(r"^\s*(?:(?:Prime|Standard|Growth|Investment\s+trusts)\s+sub-?total|total)\s*(?:金額)?\s*Val", re.I)
+SKIP_JP = re.compile(r"^\s*(?:(?:プライム|スタンダード|グロース|投信等)\s*小計|総合計|制度信用銘柄|貸借銘柄|貸借取引銘柄)")
+SKIP_EN = re.compile(
+    r"^\s*(?:(?:(?:Prime|Standard|Growth|Investment\s+trusts)\s+sub-?total|total)\s*(?:金額)?\s*Val"
+    r"|(?:[A-Za-z]+\s+){0,3}trading\s+issue\b)", re.I)   # 小計・総合計・制度信用/貸借銘柄の集計行
 INT_RE = re.compile(r"^\d[\d,]*$")
 RATIO_RE = re.compile(r"^(?:-|\*|\d+(?:\.\d+)?%)$")
-ID_RE = re.compile(r"([0-9][0-9A-Z]{4})([A-Z]{2}[0-9A-Z]{10})$")
+CODE_RE = re.compile(r"^[0-9]{3}[0-9A-Z][0-9]$")
 
 
 def tail_numbers(rest):
@@ -147,13 +149,30 @@ def tail_numbers(rest):
     return None
 
 
-def id_from_head(head):
-    """行の左側(銘柄名・コード・ISIN)から、コード5桁とISINを取り出す。
-    長い銘柄名がコード欄に重なって文字が入り混じっても、コードとISINは半角英数字なので、
-    半角英数字だけを順に並べた末尾17文字(=コード5+ISIN12)を使えば復元できる。"""
+def recover_ids(head):
+    """行の左側から (コード5桁, ISIN) を取り出す。取れなければ None。
+    長い銘柄名が重なって文字が入り混じっても、コードとISINは半角英数字なので、
+    半角英数字だけを順に並べて復元する。ETNなど半角の名前の文字(E,T,N)が混ざる行にも対応する。"""
     s = "".join(ch for ch in head if ch.isascii() and ch.isalnum())
-    m = ID_RE.search(s)
-    return (m.group(1), m.group(2)) if m else None
+    isin, region = None, ""
+    m = re.search(r"[A-Z]{2}[0-9A-Z]{10}$", s)
+    if m and (m.group()[:2] != "JP" or m.group()[2:].isdigit()):
+        isin, region = m.group(), s[:m.start()]
+    else:                                   # 日本のISINは JP+数字10桁。間に混ざった英大文字は除く
+        i = s.rfind("JP")
+        while i != -1:
+            tail = s[i + 2:]
+            digits = [c for c in tail if c.isdigit()]
+            if len(digits) == 10 and len(tail) <= 20 and all(c.isdigit() or c.isupper() for c in tail):
+                isin, region = "JP" + "".join(digits), s[:i]
+                break
+            i = s.rfind("JP", 0, i)
+    if isin is None:
+        return None, None
+    r = re.sub(r"[a-z]", "", region)        # コードに小文字はない(名前の文字が混ざったもの)
+    r = re.sub(r"[A-Z]+$", "", r)           # ISINの直前に混ざった名前の末尾(ETNなど)
+    code = r[-5:] if CODE_RE.match(r[-5:]) else None
+    return code, isin
 
 
 def clean_name(head):
@@ -181,11 +200,9 @@ def pick_name(line1, line2, code):
 
 
 def parse_issues(pdf):
-    """全ページを読み、銘柄ごとの (売,買) を 株数・金額 それぞれ返す。
-    各銘柄は『株数の行』の次に『金額の行』が来る2行組。ページをまたいでも順に対応づける。"""
-    shs, val, names, bad = {}, {}, {}, []
-    n_total = None
-    pend = None   # 直前の「株数の行」: {"raw", "nums", "ids"}
+    """全ページの『株数の行』『金額の行』を集め、ISINで1銘柄ずつ対応づける。
+    戻り値: 株数, 金額, 名前, PDFの総合計の銘柄数, 読み取れなかった行のリスト"""
+    recs, n_total = [], None
     for page in pdf.pages:
         text = page.extract_text() or ""
         for raw in text.splitlines():
@@ -198,54 +215,65 @@ def parse_issues(pdf):
             m = MARK_RE.search(raw)
             if not m:
                 continue
-            nums = tail_numbers(m.group("rest"))
-            ids = id_from_head(raw[:m.start()])
-            if m.group("mark") == "Shs":
-                if pend is not None:
-                    bad.append("[金額の行なし] " + pend["raw"])
-                pend = {"raw": raw, "nums": nums, "ids": ids}
-                continue
-            # 金額の行
-            if pend is None:
-                bad.append("[株数の行なし] " + raw)
-                continue
-            p1, pend = pend, None
-            if p1["nums"] is None:
-                bad.append("[株数・数値] " + p1["raw"])
-                continue
-            if nums is None:
-                bad.append("[金額・数値] " + raw)
-                continue
-            if p1["ids"] and ids and p1["ids"] != ids:
-                bad.append("[コード不一致] " + raw)
-                continue
-            ident = ids or p1["ids"]
-            if not ident:
-                bad.append("[コード読取不可] " + raw)
-                continue
-            code = ident[0]
-            shs[code], val[code] = p1["nums"], nums
-            names[code] = pick_name(p1["raw"], raw, code)
+            code, isin = recover_ids(raw[:m.start()])
+            recs.append({"kind": m.group("mark"), "raw": raw, "code": code, "isin": isin,
+                         "nums": tail_numbers(m.group("rest"))})
         page.flush_cache()
-    if pend is not None:
-        bad.append("[金額の行なし] " + pend["raw"])
+
+    shs, val, names, bad = {}, {}, {}, []
+    by = {"Shs": {}, "Val": {}}
+    for r in recs:
+        tag = "株数" if r["kind"] == "Shs" else "金額"
+        if r["nums"] is None:
+            bad.append(f"[{tag}・数値] " + r["raw"])
+        elif not (r["isin"] or r["code"]):
+            bad.append(f"[{tag}・コード読取不可] " + r["raw"])
+        elif (r["isin"] or r["code"]) in by[r["kind"]]:
+            bad.append(f"[{tag}・重複] " + r["raw"])
+        else:
+            by[r["kind"]][r["isin"] or r["code"]] = r
+    for key, r1 in by["Shs"].items():
+        r2 = by["Val"].get(key)
+        if r2 is None:
+            bad.append("[金額の行なし] " + r1["raw"])
+            continue
+        code = r1["code"] or r2["code"]          # 日本語の行(1行目)を優先
+        if not code:
+            bad.append("[コード読取不可] " + r2["raw"])
+            continue
+        shs[code], val[code] = r1["nums"], r2["nums"]
+        names[code] = pick_name(r1["raw"], r2["raw"], code)
+    for key, r2 in by["Val"].items():
+        if key not in by["Shs"]:
+            bad.append("[株数の行なし] " + r2["raw"])
     return shs, val, names, n_total, bad
 
 
 def check_issues(shs, val, n_total, total):
-    """読み取りの正しさを、PDFの総合計(銘柄数・売残高・買残高)と照合する。問題があれば文章のリストを返す"""
-    msgs = []
-    if set(shs) != set(val):
-        msgs.append(f"株数の行({len(shs)}件)と金額の行({len(val)}件)の銘柄が一致しません")
-    if n_total is not None and len(val) != n_total:
-        msgs.append(f"読み取れた銘柄数 {len(val)} 件が、PDFの総合計 {n_total} 銘柄と違います")
-    if total:
-        sell, buy = sum(v[0] for v in val.values()), sum(v[1] for v in val.values())
-        if (sell, buy) != tuple(total):
-            msgs.append(f"銘柄ごとの合計(売 {sell:,} / 買 {buy:,})が、総合計(売 {total[0]:,} / 買 {total[1]:,})と違います")
-    else:
-        msgs.append("総合計が読み取れていないため、照合できません")
-    return msgs
+    """読み取り結果をPDFの総合計(銘柄数・売残高・買残高)と照合する。
+    返り値: (保存してはいけない問題のリスト, 注意のリスト)
+    - 銘柄ごとの合計が総合計を超える、または大きく不足する場合は、読み取りが誤っているので保存しない
+    - ごく一部(名前が極端に長いETN/ETFなど)の読み取り漏れは、注意として知らせて保存する"""
+    fatal, notes = [], []
+    if not val:
+        return ["銘柄を1件も読み取れませんでした"], notes
+    if not total:
+        return ["総合計が読み取れていないため、照合できません"], notes
+    sell, buy = sum(v[0] for v in val.values()), sum(v[1] for v in val.values())
+    if sell > total[0] or buy > total[1]:
+        fatal.append(f"銘柄ごとの合計(売 {sell:,} / 買 {buy:,})が、総合計(売 {total[0]:,} / 買 {total[1]:,})を超えています")
+    miss_s, miss_b = total[0] - sell, total[1] - buy
+    if miss_s > total[0] * 0.01 or miss_b > total[1] * 0.01:
+        fatal.append(f"銘柄ごとの合計が、総合計より1%以上不足しています(売 {miss_s:,} / 買 {miss_b:,})")
+    if n_total is not None:
+        missing = n_total - len(val)
+        if missing < 0:
+            fatal.append(f"読み取れた銘柄数 {len(val)} 件が、PDFの総合計 {n_total} 銘柄を超えています")
+        elif missing > max(60, n_total * 0.02):
+            fatal.append(f"読み取れた銘柄数 {len(val)} 件が、PDFの総合計 {n_total} 銘柄より大きく不足しています")
+        elif missing:
+            notes.append(f"{missing} 銘柄が読み取れませんでした(売残高の不足 {miss_s:,} 円 / 買残高の不足 {miss_b:,} 円)")
+    return fatal, notes
 
 
 def stock_key(code5):
@@ -315,20 +343,22 @@ def process_stocks(date, pdf, found, out, debug):
         if debug:
             (BASE / f"debug_{date}_page1.txt").write_text(pdf.pages[0].extract_text() or "", encoding="utf-8")
             (BASE / f"debug_{date}_unparsed.txt").write_text("\n".join(bad), encoding="utf-8")
-        problems = check_issues(shs, val, n_total, found.get("total"))
-        if bad:
-            problems.append(f"読み取れなかった行が {len(bad)} 件あります")
+        problems, notes = check_issues(shs, val, n_total, found.get("total"))
+        if problems:
+            for msg in problems:
+                print(f"::warning::{date} 銘柄別データ: {msg}")
             shown = {}
             for ex in bad:
                 tag = ex.split("]")[0]
                 if shown.get(tag, 0) < 2:
                     shown[tag] = shown.get(tag, 0) + 1
                     print(f"::warning::{date} 読み取れなかった行の例: {ex[:260]}")
-        if problems:
-            for msg in problems:
-                print(f"::warning::{date} 銘柄別データ: {msg}")
             print(f"{date}: 銘柄別データは保存しませんでした (--debug で詳細を確認できます)")
             return
+        for msg in notes:
+            print(f"::notice::{date} 銘柄別データ: {msg}")
+        for ex in bad[:5]:
+            print(f"::notice::{date} 読み取れなかった行の例: {ex[:200]}")
         n = save_issues(out.parent / "stocks", date, shs, val, names)
         print(f"{date}: 銘柄別データを保存しました ({n} 銘柄 / PDF上 {len(val)} 銘柄)")
     except Exception as e:  # noqa: BLE001
