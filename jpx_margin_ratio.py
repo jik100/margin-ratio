@@ -12,7 +12,10 @@ JPX(東証) 銘柄別信用取引残高PDF -> 信用倍率(買残高 ÷ 売残�
   python jpx_margin_ratio.py --pdf x.pdf     # ローカルPDFを解析 (日付はファイル名から)
   python jpx_margin_ratio.py --debug         # 最終ページのテキストを debug_*.txt に保存
 
+  python jpx_margin_ratio.py --no-stocks     # 銘柄別データの取り込みを行わない(市場別の集計だけ)
+
 出力: margin_ratio.csv (1日1行) と、最新20日(--daysで変更可)の折れ線グラフ margin_ratio.html
+      stocks/<銘柄コード4桁>.json (銘柄別の履歴。グラフ右上の検索欄で使う)
 """
 import argparse
 import csv
@@ -115,30 +118,190 @@ def append_row(path, date, found):
     return row
 
 
-def process(date, src, out, debug):
-    text, found = extract(src)
-    if debug:
-        (BASE / f"debug_{date}_lastpage.txt").write_text(text, encoding="utf-8")
-    missing = [jp for k, jp in MARKETS if k not in found]
-    if missing:
-        raise RuntimeError(
-            f"{date}: 最終ページから {', '.join(missing)} の小計が読み取れませんでした。"
-            " --debug で最終ページのテキストを確認してください。"
-        )
-    row = append_row(out, date, found)
-    print(f"{row[0]}  " + "  ".join(f"{jp}={row[3 + 3 * i]}" for i, (_, jp) in enumerate(MARKETS)))
+# ---------------------------------------------------------------- 銘柄別データ
+# PDFの各銘柄は2行: 1行目=株数(Shs.)、2行目=金額(Val.)。どちらも
+#   売残高, 前日比, 上場比(%または*/-), 買残高, 前日比, 上場比, (一般/制度の売買内訳 8個) の14個で終わる
+ISSUE_RE = re.compile(
+    r"(?P<head>.*?)(?<!\S)(?P<code>[0-9][0-9A-Z]{4})\s+(?P<isin>[A-Z]{2}[0-9A-Z]{10})\s+"
+    r"(?P<kind>株数|金額)\s*(?:Shs|Val)\.\s*(?P<rest>.*)$")
+TOTAL_CNT_RE = re.compile(r"総合計\s*(\d[\d,]*)\s*銘柄")
+SKIP_RE = re.compile(r"sub-?total|\btotal\b|小計|総合計", re.I)
+INT_RE = re.compile(r"^\d[\d,]*$")
+
+
+def tail_numbers(rest):
+    """行末の14個から (売残高, 買残高) を返す。名前の折り返し断片が先頭に混ざっても影響しない"""
+    toks = rest.replace("▲", " ").split()
+    if len(toks) < 14:
+        return None
+    t = toks[-14:]
+    for i, x in enumerate(t):
+        if i in (2, 5):  # 上場比の列 (0.0% / * / -)
+            continue
+        if not INT_RE.match(x):
+            return None
+    return int(t[0].replace(",", "")), int(t[3].replace(",", ""))
+
+
+def clean_name(head):
+    h = re.sub(r"^[A-Z]\s+", "", head.strip())      # 先頭の売買単位記号
+    h = re.sub(r"\s+\S\s*$", "", h)                  # 末尾の 貸/制/他
+    h = re.sub(r"\s*(プライム|スタンダード|グロース|投信等)\s*$", "", h)
+    h = re.sub(r"\s*(普通株式|受益証券|投資証券|優先株式|出資証券)\s*$", "", h)
+    return h.strip()
+
+
+def parse_issues(pdf):
+    """全ページから {コード5桁: (売,買)} を 株数・金額 それぞれ返す"""
+    shs, val, names, bad = {}, {}, {}, []
+    n_total = None
+    for page in pdf.pages:
+        text = page.extract_text() or ""
+        for raw in text.splitlines():
+            line = unicodedata.normalize("NFKC", raw)
+            mt = TOTAL_CNT_RE.search(line)
+            if mt:
+                n_total = int(mt.group(1).replace(",", ""))
+            m = ISSUE_RE.search(line)
+            if not m:
+                if (("株数" in line and "Shs" in line) or ("金額" in line and "Val" in line)) \
+                        and not SKIP_RE.search(line):
+                    bad.append(raw)
+                continue
+            nums = tail_numbers(m.group("rest"))
+            if nums is None:
+                bad.append(raw)
+                continue
+            code = m.group("code")
+            if m.group("kind") == "株数":
+                shs[code] = nums
+                names[code] = clean_name(m.group("head"))
+            else:
+                val[code] = nums
+        page.flush_cache()
+    return shs, val, names, n_total, bad
+
+
+def check_issues(shs, val, n_total, total):
+    """読み取りの正しさを、PDFの総合計(銘柄数・売残高・買残高)と照合する。問題があれば文章のリストを返す"""
+    msgs = []
+    if set(shs) != set(val):
+        msgs.append(f"株数の行({len(shs)}件)と金額の行({len(val)}件)の銘柄が一致しません")
+    if n_total is not None and len(val) != n_total:
+        msgs.append(f"読み取れた銘柄数 {len(val)} 件が、PDFの総合計 {n_total} 銘柄と違います")
+    if total:
+        sell, buy = sum(v[0] for v in val.values()), sum(v[1] for v in val.values())
+        if (sell, buy) != tuple(total):
+            msgs.append(f"銘柄ごとの合計(売 {sell:,} / 買 {buy:,})が、総合計(売 {total[0]:,} / 買 {total[1]:,})と違います")
+    else:
+        msgs.append("総合計が読み取れていないため、照合できません")
+    return msgs
+
+
+def stock_key(code5):
+    return code5[:4] if code5[4] == "0" else code5
+
+
+def save_issues(sdir, date, shs, val, names):
+    """銘柄ごとのJSON(stocks/4461.json)に、その日の [売金額, 買金額, 売株数, 買株数] を追記する"""
+    sdir.mkdir(parents=True, exist_ok=True)
+    iso = f"{date[:4]}-{date[4:6]}-{date[6:]}"
+    saved = 0
+    for code, (sv, bv) in val.items():
+        ss, bs = shs.get(code, (0, 0))
+        if sv == 0 and bv == 0 and ss == 0 and bs == 0:
+            continue  # 残高がゼロの銘柄は記録しない
+        key = stock_key(code)
+        fp = sdir / f"{key}.json"
+        obj = {"c": key, "n": "", "h": {}}
+        if fp.exists():
+            try:
+                obj = json.loads(fp.read_text(encoding="utf-8"))
+            except ValueError:
+                pass
+        if names.get(code):
+            obj["n"] = names[code]
+        obj["h"][iso] = [sv, bv, ss, bs]
+        fp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        saved += 1
+    dates = read_stock_dates(sdir) | {date}
+    (sdir / "_dates.json").write_text(json.dumps(sorted(dates)), encoding="utf-8")
+    return saved
+
+
+def read_stock_dates(sdir):
+    fp = sdir / "_dates.json"
+    if not fp.exists():
+        return set()
+    try:
+        return set(json.loads(fp.read_text(encoding="utf-8")))
+    except ValueError:
+        return set()
+
+
+def process(date, src, out, debug, do_totals=True, do_stocks=True):
+    with pdfplumber.open(src) as pdf:
+        text = pdf.pages[-1].extract_text() or ""
+        found = parse_subtotals(text)
+        if debug:
+            (BASE / f"debug_{date}_lastpage.txt").write_text(text, encoding="utf-8")
+        if do_totals:
+            missing = [jp for k, jp in MARKETS if k not in found]
+            if missing:
+                raise RuntimeError(
+                    f"{date}: 最終ページから {', '.join(missing)} の小計が読み取れませんでした。"
+                    " --debug で最終ページのテキストを確認してください。"
+                )
+            row = append_row(out, date, found)
+            print(f"{row[0]}  " + "  ".join(f"{jp}={row[3 + 3 * i]}" for i, (_, jp) in enumerate(MARKETS)))
+        if do_stocks:
+            process_stocks(date, pdf, found, out, debug)
+
+
+def process_stocks(date, pdf, found, out, debug):
+    """銘柄別データを保存する。失敗しても、市場別の集計の記録は止めない(警告だけ出す)"""
+    try:
+        shs, val, names, n_total, bad = parse_issues(pdf)
+        if debug:
+            (BASE / f"debug_{date}_page1.txt").write_text(pdf.pages[0].extract_text() or "", encoding="utf-8")
+            (BASE / f"debug_{date}_unparsed.txt").write_text("\n".join(bad), encoding="utf-8")
+        problems = check_issues(shs, val, n_total, found.get("total"))
+        if bad:
+            problems.append(f"読み取れなかった行が {len(bad)} 行あります(例: {bad[0][:80]})")
+        if problems:
+            for msg in problems:
+                print(f"::warning::{date} 銘柄別データ: {msg}")
+            print(f"{date}: 銘柄別データは保存しませんでした (--debug で詳細を確認できます)")
+            return
+        n = save_issues(out.parent / "stocks", date, shs, val, names)
+        print(f"{date}: 銘柄別データを保存しました ({n} 銘柄 / PDF上 {len(val)} 銘柄)")
+    except Exception as e:  # noqa: BLE001
+        print(f"::warning::{date} 銘柄別データの処理に失敗しました: {e}")
 
 
 TOOLTIP_JS = """<script>
 (function(){
-var D=__DATA__;
-var tip=document.getElementById('tip'),guide=document.getElementById('guide');
+var D=__DATA__, G=__GEO__, STK=null, SC='#e11d74', NS='http://www.w3.org/2000/svg';
+var tip=document.getElementById('tip'),guide=document.getElementById('guide'),stk=document.getElementById('stk');
+var q=document.getElementById('q'),msgEl=document.getElementById('msg');
+function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function el(n,a,t){var e=document.createElementNS(NS,n);for(var k in a)e.setAttribute(k,a[k]);if(t!=null)e.textContent=t;return e;}
+function yen(v){if(v>=1e8)return (v/1e8).toLocaleString('ja-JP',{maximumFractionDigits:2})+'億円';return Math.round(v/1e4).toLocaleString('ja-JP')+'万円';}
+function sh(v){return v.toLocaleString('ja-JP')+'株';}
+function say(t){msgEl.textContent=t;}
 function show(i,e){
   var d=D[i],h='<b>'+d.d+'</b>';
   d.m.forEach(function(m){
     h+='<div class="row"><span class="nm" style="color:'+m.c+'">'+m.n+'</span> '+m.r+
        '<br><span class="sub">買残高 '+m.b+'億円 / 売残高 '+m.s+'億円</span></div>';
   });
+  if(STK){
+    var p=STK.pts[i],nm='<span class="nm" style="color:'+SC+'">'+esc(STK.n||STK.c)+' ('+esc(STK.c)+')</span> ';
+    if(p&&p.e){
+      h+='<div class="row">'+nm+(p.r===null?'売残高なし':p.r.toFixed(2))+
+         '<br><span class="sub">買残高 '+yen(p.e[1])+' ('+sh(p.e[3])+') / 売残高 '+yen(p.e[0])+' ('+sh(p.e[2])+')</span></div>';
+    }else{h+='<div class="row">'+nm+'<span class="sub">この日のデータなし</span></div>';}
+  }
   tip.innerHTML=h;tip.style.display='block';
   var w=tip.offsetWidth,hh=tip.offsetHeight,x=e.clientX+14,y=e.clientY+14;
   if(x+w>window.innerWidth-8)x=e.clientX-w-14;
@@ -149,12 +312,63 @@ function show(i,e){
   guide.setAttribute('x1',d.x);guide.setAttribute('x2',d.x);guide.style.display='';
 }
 function hide(){tip.style.display='none';guide.style.display='none';}
-Array.prototype.forEach.call(document.querySelectorAll('.col'),function(el){
-  el.addEventListener('mousemove',function(e){show(+el.getAttribute('data-i'),e);});
-  el.addEventListener('mouseleave',hide);
-  el.addEventListener('click',function(e){show(+el.getAttribute('data-i'),e);});
+Array.prototype.forEach.call(document.querySelectorAll('.col'),function(el_){
+  el_.addEventListener('mousemove',function(e){show(+el_.getAttribute('data-i'),e);});
+  el_.addEventListener('mouseleave',hide);
+  el_.addEventListener('click',function(e){show(+el_.getAttribute('data-i'),e);});
 });
 document.addEventListener('click',function(e){if(!e.target.closest||!e.target.closest('.col'))hide();});
+
+function clearStk(){while(stk.firstChild)stk.removeChild(stk.firstChild);STK=null;}
+function tick(v){return v>=100?v.toFixed(0):(v>=10?v.toFixed(1):v.toFixed(2));}
+function draw(j,code){
+  clearStk();
+  var pts=G.dates.map(function(d,i){var e=(j.h&&j.h[d])||null;return {e:e,r:(e&&e[0]>0)?e[1]/e[0]:null,x:D[i].x};});
+  STK={c:code,n:j.n||'',pts:pts};
+  var vs=pts.filter(function(p){return p.r!==null;}).map(function(p){return p.r;});
+  var have=pts.filter(function(p){return p.e;}).length;
+  if(!vs.length){say((j.n||code)+' ('+code+'): 表示期間に、売残高があり倍率を計算できる日がありません。');return;}
+  var lo=Math.min.apply(null,vs),hi=Math.max.apply(null,vs),pad=(hi-lo)*0.12||Math.max(hi*0.1,0.5);
+  lo=Math.max(0,lo-pad);hi=hi+pad;
+  var ph=G.H-G.T-G.B;
+  function Y(v){return G.T+ph*(1-(v-lo)/(hi-lo));}
+  var ax=G.W-G.R+112;
+  stk.appendChild(el('line',{x1:ax,x2:ax,y1:G.T,y2:G.H-G.B,stroke:SC}));
+  for(var t=0;t<=5;t++){
+    var v=lo+(hi-lo)*t/5,y=Y(v);
+    stk.appendChild(el('line',{x1:ax-4,x2:ax,y1:y,y2:y,stroke:SC}));
+    stk.appendChild(el('text',{x:ax+7,y:y+4,fill:SC,'font-size':12},tick(v)));
+  }
+  var title=(j.n||code);if(title.length>16)title=title.slice(0,16)+'…';
+  stk.appendChild(el('text',{x:G.W-6,y:G.T-12,'text-anchor':'end',fill:SC,'font-size':12,'font-weight':700},title+' ('+code+') 右軸'));
+  var seg=[];
+  function flush(){if(seg.length>1)stk.appendChild(el('polyline',{points:seg.map(function(a){return a[0]+','+a[1];}).join(' '),fill:'none',stroke:SC,'stroke-width':2.5,'stroke-dasharray':'7 4'}));seg=[];}
+  pts.forEach(function(p){
+    if(p.r===null){flush();return;}
+    var y=Y(p.r);seg.push([p.x,y]);
+    stk.appendChild(el('circle',{cx:p.x,cy:y,r:4,fill:SC}));
+  });
+  flush();
+  say((j.n||code)+' ('+code+') を右軸(ピンクの破線)で表示中。データのある日: '+have+' / '+G.dates.length+' 日'+(have<G.dates.length?'(取り込み開始前の日は空白です)':''));
+}
+function norm(s){s=s.normalize('NFKC').trim().toUpperCase();if(s.length===5&&s.charAt(4)==='0')s=s.slice(0,4);return s;}
+function go(){
+  var c=norm(q.value);
+  if(!/^[0-9][0-9A-Z]{3,4}$/.test(c)){say('銘柄コードは4桁で入力してください(例: 4461)');return;}
+  say('読み込み中…');
+  fetch('stocks/'+c+'.json?'+Date.now(),{cache:'no-store'}).then(function(r){
+    if(r.status===404)throw new Error('404');
+    if(!r.ok)throw new Error('http');
+    return r.json();
+  }).then(function(j){draw(j,c);}).catch(function(e){
+    clearStk();
+    say(e.message==='404'?'コード '+c+' のデータが見つかりません(取り込み開始前の銘柄、または信用残高がゼロの銘柄です)。'
+                          :'読み込めませんでした。この機能は、公開URL(GitHub Pages)でページを開いたときに使えます。');
+  });
+}
+document.getElementById('go').addEventListener('click',go);
+document.getElementById('clr').addEventListener('click',function(){clearStk();q.value='';say('');});
+q.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();go();}});
 })();
 </script>"""
 
@@ -170,7 +384,7 @@ def make_html(csv_path, html_path, n=20):
         rows = sorted(csv.DictReader(f), key=lambda r: r["date"])[-n:]
     if not rows:
         return
-    W, H, L, R, T, B = (900 if len(rows) <= 7 else 1100), 460, 70, 150, 30, 60
+    W, H, L, R, T, B = (950 if len(rows) <= 7 else 1150), 460, 70, 200, 30, 60
     show_all = len(rows) <= 7  # 点が多いときは数値ラベルを最終日だけにする(マウスを乗せると各点の値が出る)
     vals = [float(r[f"{k}_ratio"]) for k, _ in MARKETS for r in rows]
     lo, hi = min(vals), max(vals)
@@ -211,10 +425,13 @@ def make_html(csv_path, html_path, n=20):
             {"n": jp, "c": COLORS[k], "r": f'{float(r[f"{k}_ratio"]):.2f}',
              "b": oku(r[f"{k}_buy"]), "s": oku(r[f"{k}_sell"])} for k, jp in MARKETS]})
     step = (W - L - R) / (len(rows) - 1) if len(rows) > 1 else (W - L - R)
+    g.append('<g id="stk"></g>')  # 銘柄検索の結果(5本目・右軸)はここにJSが描く
     g.append(f'<line id="guide" x1="0" x2="0" y1="{T}" y2="{H-B}" class="guide" style="display:none"/>')
     for i in range(len(rows)):
         g.append(f'<rect class="col" data-i="{i}" x="{X(i) - step / 2:.1f}" y="{T}" width="{step:.1f}" height="{H-T-B}" fill="transparent"/>')
-    js = TOOLTIP_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False))
+    geo = {"W": W, "H": H, "L": L, "R": R, "T": T, "B": B, "dates": [r["date"] for r in rows]}
+    js = (TOOLTIP_JS.replace("__DATA__", json.dumps(data, ensure_ascii=False))
+                    .replace("__GEO__", json.dumps(geo, ensure_ascii=False)))
 
     head = "".join(f"<th>{jp}</th>" for _, jp in MARKETS)
     body = "".join(
@@ -234,10 +451,18 @@ h1{{font-size:1.2rem}} svg{{max-width:100%;height:auto}}
 th,td{{border:1px solid var(--grid);padding:6px 12px;text-align:right}}
 .col{{cursor:crosshair}} .guide{{stroke:var(--mut);stroke-dasharray:4 4}} .hint{{color:var(--mut);font-size:12px;margin:4px 0}}
 #tip{{position:fixed;display:none;pointer-events:none;background:var(--bg);color:var(--fg);border:1px solid var(--grid);border-radius:8px;padding:8px 12px;font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,.35);z-index:10;white-space:nowrap}}
+.bar{{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px}} .bar .hint{{flex:1 1 320px}}
+.search{{display:flex;gap:6px;align-items:center}}
+.search input{{font-size:16px;width:11em;padding:6px 8px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg)}}
+.search button{{font-size:14px;padding:6px 12px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}}
 #tip .row{{margin-top:6px}} #tip .nm{{font-weight:700}} #tip .sub{{color:var(--mut);font-size:12px}}
 </style></head><body>
 <h1>信用倍率(買残高÷売残高) 直近{len(rows)}日(申込日ベース)</h1>
+<div class="bar">
 <p class="hint">グラフにマウスを乗せる(スマホはタップ)と、各市場の買残高・売残高(億円)が表示されます。</p>
+<div class="search"><input id="q" type="text" maxlength="5" placeholder="銘柄コード 例: 4461" autocomplete="off" aria-label="銘柄コード"><button id="go" type="button">表示</button><button id="clr" type="button">消す</button></div>
+</div>
+<p id="msg" class="hint"></p>
 <div class="wrap"><svg viewBox="0 0 {W} {H}" width="{W}" role="img" aria-label="信用倍率の推移">{"".join(g)}</svg></div>
 <div class="wrap"><table><tr><th>申込日</th>{head}</tr>{body}</table></div>
 <div id="tip"></div>
@@ -253,17 +478,22 @@ def main():
     ap.add_argument("--date", help="申込日 YYYYMMDD (省略時は未記録の日付すべて)")
     ap.add_argument("--pdf", help="ローカルPDFを使う")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--no-stocks", action="store_true", help="銘柄別データを取り込まない")
     ap.add_argument("--days", type=int, default=20, help="グラフに表示する日数 (既定20)")
     a = ap.parse_args()
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     done = read_existing(out)
+    sdir = out.parent / "stocks"
+    done_stocks = read_stock_dates(sdir)
 
     if a.pdf:
         m = re.search(r"(\d{8})", Path(a.pdf).name)
         if not m:
             sys.exit("ファイル名から日付(YYYYMMDD)を取れません")
-        process(m.group(1), a.pdf, out, a.debug)
+        d = m.group(1)
+        iso = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        process(d, a.pdf, out, a.debug, iso not in done, not a.no_stocks and d not in done_stocks)
         return out, a.days
 
     pdfs = list_pdfs()
@@ -271,14 +501,16 @@ def main():
     new = 0
     for d in targets:
         iso = f"{d[:4]}-{d[4:6]}-{d[6:]}"
-        if iso in done:
+        need_totals = iso not in done
+        need_stocks = not a.no_stocks and d not in done_stocks
+        if not need_totals and not need_stocks:
             continue
         if d not in pdfs:
             print(f"{d}: まだページに掲載されていません")
             continue
         r = requests.get(pdfs[d], headers=HEADERS, timeout=120)
         r.raise_for_status()
-        process(d, io.BytesIO(r.content), out, a.debug)
+        process(d, io.BytesIO(r.content), out, a.debug, need_totals, need_stocks)
         new += 1
     if new == 0:
         print("新しいデータはありません")
