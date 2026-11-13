@@ -179,9 +179,44 @@ def recover_ids(head):
     return (r[-5:] if CODE_RE.match(r[-5:]) else None), isin, False
 
 
+KINDS = ["普通株式", "受益証券", "投資証券", "優先株式", "出資証券"]
+MKTS = ["プライム", "スタンダード", "グロース", "投信等"]
+
+
+def is_interleave(t, a, b):
+    """t が、a と b を(各々の文字の順序を保ったまま)混ぜ合わせた文字列かどうか"""
+    n, m = len(a), len(b)
+    if len(t) != n + m:
+        return False
+    dp = [[False] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = True
+    for i in range(n + 1):
+        for j in range(m + 1):
+            if not dp[i][j] or i + j >= len(t):
+                continue
+            if i < n and t[i + j] == a[i]:
+                dp[i + 1][j] = True
+            if j < m and t[i + j] == b[j]:
+                dp[i][j + 1] = True
+    return dp[n][m]
+
+
+def strip_interleaved(h):
+    """銘柄名が長く、右隣の欄の「普通株式」「プライム」と重なって文字が入り混じった末尾を取り除く
+    (例: 『…グループ 普プ通ラ株イ式ム』 → 『…グループ』)"""
+    h = h.rstrip()
+    combos = sorted(((k, m) for k in KINDS for m in MKTS), key=lambda km: -(len(km[0]) + len(km[1])))
+    for k, m in combos:
+        L = len(k) + len(m)
+        if len(h) > L and is_interleave(h[-L:], k, m):
+            return h[:-L].rstrip()
+    return h
+
+
 def clean_name(head):
     h = re.sub(r"^[A-Z]\s+", "", head.strip())      # 先頭の売買単位記号
     h = re.sub(r"\s+\S\s*$", "", h)                  # 末尾の 貸/制/他
+    h = strip_interleaved(h)
     h = re.sub(r"\s*(プライム|スタンダード|グロース|投信等)\s*$", "", h)
     h = re.sub(r"\s*(普通株式|受益証券|投資証券|優先株式|出資証券)\s*$", "", h)
     h = re.sub(r"\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*(?:貸|制|他)?\s*$", "", h)
@@ -402,7 +437,28 @@ function el(n,a,t){var e=document.createElementNS(NS,n);for(var k in a)e.setAttr
 function yen(v){if(v>=1e8)return (v/1e8).toLocaleString('ja-JP',{maximumFractionDigits:2})+'億円';return Math.round(v/1e4).toLocaleString('ja-JP')+'万円';}
 function sh(v){return v.toLocaleString('ja-JP')+'株';}
 function say(t){msgEl.textContent=t;}
-function cname(n){return String(n||'').replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();}
+var KINDS=['普通株式','受益証券','投資証券','優先株式','出資証券'],MKTS=['プライム','スタンダード','グロース','投信等'];
+function inter(t,a,b){/* t が a と b を(各々の順序を保って)混ぜ合わせた文字列か */
+  var n=a.length,m=b.length;if(t.length!==n+m)return false;
+  var dp=[],i,j;for(i=0;i<=n;i++){dp.push(new Array(m+1).fill(false));}
+  dp[0][0]=true;
+  for(i=0;i<=n;i++)for(j=0;j<=m;j++){
+    if(!dp[i][j])continue;var k=i+j;if(k>=t.length)continue;
+    if(i<n&&t.charAt(k)===a.charAt(i))dp[i+1][j]=true;
+    if(j<m&&t.charAt(k)===b.charAt(j))dp[i][j+1]=true;
+  }
+  return dp[n][m];
+}
+function cname(n){
+  var h=String(n||'').replace(/\s+$/,''),combos=[];
+  KINDS.forEach(function(k){MKTS.forEach(function(m){combos.push([k,m]);});});
+  combos.sort(function(x,y){return (y[0].length+y[1].length)-(x[0].length+x[1].length);});
+  for(var c=0;c<combos.length;c++){
+    var L=combos[c][0].length+combos[c][1].length;
+    if(h.length>L&&inter(h.slice(-L),combos[c][0],combos[c][1])){h=h.slice(0,-L).replace(/\s+$/,'');break;}
+  }
+  return h.replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();
+}
 function show(i,e){
   var d=D[i],h='<b>'+d.d+'</b>';
   d.m.forEach(function(m){
