@@ -15,7 +15,7 @@ JPX(東証) 銘柄別信用取引残高PDF -> 信用倍率(買残高 ÷ 売残�
   python jpx_margin_ratio.py --no-stocks     # 銘柄別データの取り込みを行わない(市場別の集計だけ)
 
 出力: margin_ratio.csv (1日1行) と、最新20日(--daysで変更可)の折れ線グラフ margin_ratio.html
-      stocks/<銘柄コード4桁>.json (銘柄別の履歴。グラフ右上の検索欄で使う)
+      stocks/<銘柄コード4桁>.json (銘柄別の履歴)、stocks/index.json (検索欄の候補表示用)
 """
 import argparse
 import csv
@@ -330,6 +330,39 @@ def check_issues(shs, val, n_total, total):
     return fatal, notes
 
 
+def tidy_name(n):
+    """保存済みの名前に残った、重なった『普通株式プライム』などを取り除く"""
+    h = strip_interleaved(n or "")
+    h = re.sub(r"\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$", "", h)
+    return h.strip()
+
+
+def build_index(sdir):
+    """銘柄名・コードの候補表示用に、stocks/index.json を作る(全銘柄の [コード, 名前, 最新の倍率(株数ベース)])"""
+    if not sdir.exists():
+        return
+    rows, latest = [], ""
+    for fp in sorted(sdir.glob("*.json")):
+        if fp.name in ("_dates.json", "index.json"):
+            continue
+        try:
+            obj = json.loads(fp.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        h = obj.get("h") or {}
+        if not h:
+            continue
+        d = max(h)
+        e = h[d]
+        ratio = round(e[3] / e[2], 2) if len(e) >= 4 and e[2] > 0 else None
+        latest = max(latest, d)
+        rows.append([obj.get("c") or fp.stem, tidy_name(obj.get("n", "")), ratio, d])
+    items = [[c, n, (r if d == latest else None)] for c, n, r, d in rows]  # 古い日の倍率は載せない
+    (sdir / "index.json").write_text(
+        json.dumps({"d": latest, "s": items}, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    print(f"候補用の索引を更新しました ({len(items)} 銘柄)")
+
+
 def stock_key(code5):
     return code5[:4] if code5[4] == "0" else code5
 
@@ -487,7 +520,10 @@ Array.prototype.forEach.call(document.querySelectorAll('.col'),function(el_){
   el_.addEventListener('mouseleave',hide);
   el_.addEventListener('click',function(e){show(+el_.getAttribute('data-i'),e);});
 });
-document.addEventListener('click',function(e){if(!e.target.closest||!e.target.closest('.col'))hide();});
+document.addEventListener('click',function(e){
+  if(!e.target.closest||!e.target.closest('.col'))hide();
+  if(!e.target.closest||!e.target.closest('.search'))hideSug();
+});
 
 function clearStk(){while(stk.firstChild)stk.removeChild(stk.firstChild);STK=null;}
 function tick(v){return v>=100?v.toFixed(0):(v>=10?v.toFixed(1):v.toFixed(2));}
@@ -524,7 +560,9 @@ function draw(j,code){
 function norm(s){s=s.normalize('NFKC').trim().toUpperCase();if(s.length===5&&s.charAt(4)==='0')s=s.slice(0,4);return s;}
 function go(){
   var c=norm(q.value);
-  if(!/^[0-9][0-9A-Z]{3,4}$/.test(c)){say('銘柄コードは4桁で入力してください(例: 4461)');return;}
+  if(!/^[0-9][0-9A-Z]{3,4}$/.test(c)&&cur.length){pick(cur[0]);return;}   /* 名前を入れて「表示」: 先頭の候補を選ぶ */
+  hideSug();
+  if(!/^[0-9][0-9A-Z]{3,4}$/.test(c)){say('銘柄名を入れて候補から選ぶか、4桁のコードを入力してください(例: 4461)');return;}
   say('読み込み中…');
   fetch('stocks/'+c+'.json?'+Date.now(),{cache:'no-store'}).then(function(r){
     if(r.status===404)throw new Error('404');
@@ -537,8 +575,67 @@ function go(){
   });
 }
 document.getElementById('go').addEventListener('click',go);
-document.getElementById('clr').addEventListener('click',function(){clearStk();q.value='';say('');});
-q.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();go();}});
+document.getElementById('clr').addEventListener('click',function(){clearStk();q.value='';say('');hideSug();});
+
+/* ---- 銘柄名・コードのサジェスト(候補表示) ---- */
+var sug=document.getElementById('sug'),IDX=null,IDXP=null,IDXFAIL=false,cur=[],act=-1;
+function nz(t){return String(t).normalize('NFKC').toLowerCase()
+  .replace(/[\u3041-\u3096]/g,function(c){return String.fromCharCode(c.charCodeAt(0)+0x60);})
+  .replace(/[\s・･·\-()「」]/g,'');}
+function loadIdx(){
+  if(IDX)return Promise.resolve(IDX);
+  if(IDXFAIL)return Promise.resolve(null);
+  if(IDXP)return IDXP;
+  IDXP=fetch('stocks/index.json?'+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('x');return r.json();})
+    .then(function(j){IDX=j.s.map(function(e){var n=cname(e[1]);return {c:e[0],n:n,r:e[2],k:nz(n),ck:String(e[0]).toLowerCase()};});return IDX;})
+    .catch(function(){IDXFAIL=true;return null;});
+  return IDXP;
+}
+function hideSug(){sug.style.display='none';cur=[];act=-1;}
+function renderSug(empty){
+  while(sug.firstChild)sug.removeChild(sug.firstChild);
+  if(!cur.length){
+    if(!empty){hideSug();return;}
+    var n=document.createElement('li');n.className='none';n.textContent='該当する銘柄がありません';sug.appendChild(n);sug.style.display='block';return;
+  }
+  cur.forEach(function(e,i){
+    var li=document.createElement('li');li.className=(i===act?'act':'');li.setAttribute('role','option');
+    var l=document.createElement('div'),a=document.createElement('div'),b=document.createElement('div'),r=document.createElement('div');
+    a.className='sn';a.textContent=e.n||e.c;b.className='sc';b.textContent=e.c;
+    l.appendChild(a);l.appendChild(b);
+    r.className='sr';r.textContent=(e.r==null?'—':e.r.toFixed(2));r.title='最新の信用倍率(株数ベース)';
+    li.appendChild(l);li.appendChild(r);
+    li.addEventListener('click',function(){pick(e);});
+    sug.appendChild(li);
+  });
+  sug.style.display='block';
+}
+function suggest(){
+  var qq=nz(q.value);
+  if(!qq){hideSug();return;}
+  loadIdx().then(function(idx){
+    if(!idx||nz(q.value)!==qq)return;
+    var codeLike=/^[0-9][0-9a-z]{0,4}$/.test(qq),res=[];
+    for(var i=0;i<idx.length;i++){
+      var e=idx[i],sc=-1,p;
+      if(codeLike&&e.ck.indexOf(qq)===0)sc=0;
+      else{p=e.k.indexOf(qq);if(p===0)sc=1;else if(p>0)sc=2;}
+      if(sc>=0)res.push({e:e,s:sc});
+    }
+    res.sort(function(x,y){return x.s-y.s||(x.e.c<y.e.c?-1:1);});
+    cur=res.slice(0,8).map(function(x){return x.e;});act=-1;renderSug(true);
+  });
+}
+function pick(e){q.value=e.c;hideSug();go();}
+q.addEventListener('input',suggest);
+q.addEventListener('focus',function(){loadIdx();if(q.value)suggest();});
+q.addEventListener('keydown',function(e){
+  var open=sug.style.display==='block'&&cur.length>0;
+  if(e.key==='ArrowDown'&&open){e.preventDefault();act=(act+1)%cur.length;renderSug(true);}
+  else if(e.key==='ArrowUp'&&open){e.preventDefault();act=(act<=0?cur.length:act)-1;renderSug(true);}
+  else if(e.key==='Escape'){hideSug();}
+  else if(e.key==='Enter'){e.preventDefault();if(open&&act>=0)pick(cur[act]);else go();}
+});
 })();
 </script>"""
 
@@ -622,15 +719,19 @@ th,td{{border:1px solid var(--grid);padding:6px 12px;text-align:right}}
 .col{{cursor:crosshair}} .guide{{stroke:var(--mut);stroke-dasharray:4 4}} .hint{{color:var(--mut);font-size:12px;margin:4px 0}}
 #tip{{position:fixed;display:none;pointer-events:none;background:var(--bg);color:var(--fg);border:1px solid var(--grid);border-radius:8px;padding:8px 12px;font-size:13px;line-height:1.5;box-shadow:0 4px 14px rgba(0,0,0,.35);z-index:10;white-space:nowrap}}
 .bar{{display:flex;justify-content:space-between;align-items:flex-end;flex-wrap:wrap;gap:8px;max-width:{W}px}} .bar .hint{{flex:1 1 320px}}
-.search{{display:flex;gap:6px;align-items:center}}
-.search input{{font-size:16px;width:11em;padding:6px 8px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg)}}
+.search{{display:flex;gap:6px;align-items:center;position:relative}}
+.sug{{position:absolute;right:0;top:100%;margin:4px 0 0;padding:4px 0;list-style:none;width:min(440px,92vw);max-height:60vh;overflow:auto;background:var(--bg);color:var(--fg);border:1px solid var(--grid);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.35);z-index:30;display:none}}
+.sug li{{display:flex;justify-content:space-between;gap:12px;padding:8px 12px;cursor:pointer}}
+.sug li.act,.sug li:hover{{background:rgba(127,127,127,.18)}}
+.sug li.none{{color:var(--mut);cursor:default}} .sug .sn{{font-weight:600}} .sug .sc{{color:var(--mut);font-size:12px}} .sug .sr{{white-space:nowrap;align-self:center;font-variant-numeric:tabular-nums}}
+.search input{{font-size:16px;width:15em;padding:6px 8px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg)}}
 .search button{{font-size:14px;padding:6px 12px;border:1px solid var(--grid);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}}
 #tip .row{{margin-top:6px}} #tip .nm{{font-weight:700}} #tip .sub{{color:var(--mut);font-size:12px}}
 </style></head><body>
 <h1>信用倍率(買残高÷売残高) 直近{len(rows)}日(申込日ベース)</h1>
 <div class="bar">
-<p class="hint">グラフにマウスを乗せる(スマホはタップ)と、各市場の買残高・売残高(億円)が表示されます。</p>
-<div class="search"><input id="q" type="text" maxlength="5" placeholder="銘柄コード 例: 4461" autocomplete="off" aria-label="銘柄コード"><button id="go" type="button">表示</button><button id="clr" type="button">消す</button></div>
+<p class="hint">グラフにマウスを乗せる(スマホはタップ)と、各市場の買残高・売残高(億円)が表示されます。右上の欄に銘柄名またはコードを入れると、候補が出ます。</p>
+<div class="search"><input id="q" type="text" placeholder="銘柄名・コード 例: 三井住友 / 8316" autocomplete="off" aria-label="銘柄名またはコード" aria-autocomplete="list"><button id="go" type="button">表示</button><button id="clr" type="button">消す</button><ul id="sug" class="sug" role="listbox"></ul></div>
 </div>
 <p id="msg" class="hint"></p>
 <div class="wrap"><svg viewBox="0 0 {W} {H}" width="{W}" role="img" aria-label="信用倍率の推移">{"".join(g)}</svg></div>
@@ -690,3 +791,4 @@ def main():
 if __name__ == "__main__":
     out_path, days = main()
     make_html(out_path, out_path.with_suffix(".html"), days)
+    build_index(out_path.parent / "stocks")
