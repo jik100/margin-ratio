@@ -203,13 +203,21 @@ def is_interleave(t, a, b):
 
 def strip_interleaved(h):
     """銘柄名が長く、右隣の欄の「普通株式」「プライム」と重なって文字が入り混じった末尾を取り除く
-    (例: 『…グループ 普プ通ラ株イ式ム』 → 『…グループ』)"""
+    (例: 『…グループ 普プ通ラ株イ式ム』『…グループプ ラ普イ通ム株式』 → 『…グループ』)。
+    入り混じった文字の間に空白が入っていても構わない。"""
     h = h.rstrip()
     combos = sorted(((k, m) for k in KINDS for m in MKTS), key=lambda km: -(len(km[0]) + len(km[1])))
     for k, m in combos:
-        L = len(k) + len(m)
-        if len(h) > L and is_interleave(h[-L:], k, m):
-            return h[:-L].rstrip()
+        L, cnt, i = len(k) + len(m), 0, len(h)
+        while i > 0 and cnt < L:                 # 末尾から、空白を除いて L 文字ぶんをさかのぼる
+            i -= 1
+            if not h[i].isspace():
+                cnt += 1
+        if cnt == L and h[:i].strip() and is_interleave(re.sub(r"\s+", "", h[i:]), k, m):
+            r = h[:i].rstrip()
+            if len(r) >= 2 and r[-1] == r[-2] and r[-1] in k + m:
+                r = r[:-1]      # 名前の最後の文字が、重なった欄の同じ文字と二重になって残ったもの(…グループププ → …グループ)
+            return r
     return h
 
 
@@ -487,8 +495,13 @@ function cname(n){
   KINDS.forEach(function(k){MKTS.forEach(function(m){combos.push([k,m]);});});
   combos.sort(function(x,y){return (y[0].length+y[1].length)-(x[0].length+x[1].length);});
   for(var c=0;c<combos.length;c++){
-    var L=combos[c][0].length+combos[c][1].length;
-    if(h.length>L&&inter(h.slice(-L),combos[c][0],combos[c][1])){h=h.slice(0,-L).replace(/\s+$/,'');break;}
+    var L=combos[c][0].length+combos[c][1].length,cnt=0,i=h.length;
+    while(i>0&&cnt<L){i--;if(!/\s/.test(h.charAt(i)))cnt++;}   /* 末尾から、空白を除いて L 文字ぶんをさかのぼる */
+    if(cnt===L&&h.slice(0,i).replace(/\s+$/,'')!==''&&inter(h.slice(i).replace(/\s+/g,''),combos[c][0],combos[c][1])){
+      h=h.slice(0,i).replace(/\s+$/,'');
+      if(h.length>=2&&h.charAt(h.length-1)===h.charAt(h.length-2)&&(combos[c][0]+combos[c][1]).indexOf(h.charAt(h.length-1))>=0)h=h.slice(0,-1);   /* 二重になった最後の1文字(…グループププ → …グループ) */
+      break;
+    }
   }
   return h.replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();
 }
