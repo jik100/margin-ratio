@@ -58,8 +58,13 @@ function cname(n){
   KINDS.forEach(function(k){MKTS.forEach(function(m){combos.push([k,m]);});});
   combos.sort(function(x,y){return (y[0].length+y[1].length)-(x[0].length+x[1].length);});
   for(var c=0;c<combos.length;c++){
-    var L=combos[c][0].length+combos[c][1].length;
-    if(h.length>L&&inter(h.slice(-L),combos[c][0],combos[c][1])){h=h.slice(0,-L).replace(/\s+$/,'');break;}
+    var L=combos[c][0].length+combos[c][1].length,cnt=0,i=h.length;
+    while(i>0&&cnt<L){i--;if(!/\s/.test(h.charAt(i)))cnt++;}   /* 末尾から、空白を除いて L 文字ぶんをさかのぼる */
+    if(cnt===L&&h.slice(0,i).replace(/\s+$/,'')!==''&&inter(h.slice(i).replace(/\s+/g,''),combos[c][0],combos[c][1])){
+      h=h.slice(0,i).replace(/\s+$/,'');
+      if(h.length>=2&&h.charAt(h.length-1)===h.charAt(h.length-2)&&(combos[c][0]+combos[c][1]).indexOf(h.charAt(h.length-1))>=0)h=h.slice(0,-1);   /* 二重になった最後の1文字(…グループププ → …グループ) */
+      break;
+    }
   }
   return h.replace(/\s*(?:普通株式|受益証券|投資証券|優先株式|出資証券)\s*(?:プライム|スタンダード|グロース|投信等)?\s*$/,'').trim();
 }
